@@ -4,10 +4,10 @@ import numpy as np
 import pandas as pd
 import time
 from PIL import Image
-from .core.patterns import PatternLibrary
-from .solvers.wfc_solver import WFCSolver
-from .solvers.mrf_solver import MRFSolver
-from .render.renderer import RangePatternRenderer
+from .patterns import PatternLibrary
+from .wfc_solver import WFCSolver
+from .mrf_solver import MRFSolver
+from .renderer import RangePatternRenderer
 
 SOLVERS = {
     'wfc': WFCSolver,
@@ -16,16 +16,12 @@ SOLVERS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description='Overlap WFC refactored CLI')
-    # make input_png and input_npz mutually exclusive, at least one required
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument('--input_png', type=str, 
-                       help='Input PNG file for pattern extraction')
-    group.add_argument('--input_patterns', type=str, 
-                       help='Input npz file containing pre-extracted patterns and frequencies')
+    p.add_argument('--input_mode', type=str, choices=['png', 'range_patterns'], required=True,
+                   help='Input mode: "png" for PNG bitmap extraction, "range_patterns" for pre-extracted npz patterns')
+    p.add_argument('--input_file', type=str, required=True,
+                   help='Path to input file (PNG for png mode, npz for range_patterns mode)')
     p.add_argument('--compatibility', type=str, default=None, 
                    help='Optional precomputed compatibility lookup table npz file')
-    p.add_argument('--use_range_pattern', action='store_true', 
-                   help='Use range pattern representation for compatibility (experimental)')
     p.add_argument('--pattern_rank', type=str, default='3x3', 
                    help='Pattern rank to use from npz file if --input_patterns is used (default 3x3)')
     p.add_argument('--pattern_size', type=int, nargs='+', default=[3], 
@@ -39,7 +35,6 @@ def parse_args():
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--augment_rot_reflect', action='store_true')
     p.add_argument('--periodic_input', action='store_true')
-    p.add_argument('--blend_average', action='store_true')
     p.add_argument('--start_token', type=int, default=None)
     p.add_argument('--num_outputs', type=int, default=1, 
                    help='Number of outputs to generate with different random seeds (default 1; set 10 for batch)')
@@ -64,21 +59,23 @@ def main():
         overlap = tuple(args.overlap)
     else:
         raise ValueError("--overlap must be 1 or 2 integers")
+    # Derive use_range_pattern from input_mode
+    use_range_pattern = (args.input_mode == 'range_patterns')
     # Prepare output directory based on input filename
-    input_file =  args.input_png if args.input_png else args.input_patterns
+    input_file = args.input_file
     if args.output_dir is None:
         raise ValueError("Output directory must be specified with --output_dir to save results.")
-    output_dir = os.path.join("wfc_outputs", args.output_dir)
+    output_dir = os.path.join(args.output_dir, args.pattern_rank)
     os.makedirs(output_dir, exist_ok=True)
     
-    if args.input_patterns:
+    if args.input_mode == 'range_patterns':
         # load pre-extracted patterns and frequencies from npz
-        data = np.load(args.input_patterns, allow_pickle=True)
+        data = np.load(args.input_file, allow_pickle=True)
         lib = PatternLibrary.from_extracted_patterns(data, pattern_rank=args.pattern_rank)
     else:
         # standard WFC pattern extraction from input PNG (color bitmap)
         lib = PatternLibrary.from_png(
-            args.input_png,
+            args.input_file,
             N=pattern_size,
             overlap=overlap,
             periodic_input=args.periodic_input,
@@ -94,7 +91,7 @@ def main():
     if args.compatibility is None:
         # print time elapsed for compatibility building to console
         start_time = time.time()
-        if args.use_range_pattern:
+        if use_range_pattern:
             print("Building compatibility using FAST range pattern representation...")
             lib.build_compatibility_for_range_pattern_fast()
         else:
@@ -104,7 +101,7 @@ def main():
         print(f"Compatibility building completed in {end_time - start_time:.2f} seconds.")
         # save compatibility lookup table to npz for later reuse
         np.savez_compressed(
-            os.path.join(output_dir, f"compatibility_{lib.Ny}x{lib.Nx}_{lib.K}.npz"),
+            os.path.join(output_dir, f"compatibility_{args.pattern_rank}_{lib.K}.npz"),
             allow=lib.allow,
         )
     else:
@@ -129,7 +126,7 @@ def main():
     # for detailed logging of each attempt
 
     dateID = time.strftime("%Y%m%d-%H%M%S")
-    output_dir = os.path.join(output_dir, args.pattern_rank+"_to_"+f"{cell_h}x{cell_w}", dateID)
+    output_dir = os.path.join(output_dir, dateID)
     os.makedirs(output_dir, exist_ok=True)
     for out_idx in range(num):
         success = False
@@ -169,22 +166,28 @@ def main():
     time_log.to_csv(os.path.join(output_dir, "generation_time_log.csv"), index=False)
     with open(os.path.join(output_dir, "generation_summary.txt"), "w") as f:
         f.write(summary.to_string(index=False))
+    
     # save output patterns and seeds to npz for later reuse
     generated_patterns = []
-    if args.use_range_pattern:
-        render = RangePatternRenderer(lib)
+    if use_range_pattern:
+        render = RangePatternRenderer(lib.idx2pattern, lib.index_to_width, lib.index_to_height, context_size=20)
         for grid, seed in zip(output_grids, seeds):
-            encoded_pattern = render.grid_to_pattern(grid)
+            encoded_pattern = render.grid_to_encoded_pattern(grid)
             generated_patterns.append(encoded_pattern)
-        generated_patterns = np.stack(generated_patterns, axis=0)  # shape (num, H, W, 3)
-        _shape = "x".join(map(str, generated_patterns.shape))
-        np.savez_compressed(
-            os.path.join(output_dir, f"{args.pattern_rank}_wfc_output_{_shape}_generated_range_patterns.npz"),
-            patterns=np.stack(generated_patterns),
-            seeds=seeds,
-            index_to_width=lib.index_to_width,
-            index_to_height=lib.index_to_height,
-        )
+        if generated_patterns:
+            generated_patterns = np.stack(generated_patterns, axis=0)  # shape (num, H, W, 3)
+            success_nums, out_m, out_n, _, = generated_patterns.shape
+            np.savez_compressed(
+                os.path.join(output_dir, f"wfc_outputs_{out_m}x{out_n}_{success_nums}_patterns.npz"),
+                patterns=np.stack(generated_patterns),
+                seeds=seeds,
+                index_to_width=lib.index_to_width,
+                index_to_height=lib.index_to_height,
+            )
+        for encoded_pattern, seed in zip(generated_patterns, seeds):
+            #render.plot_input_patterns_mxn(idx_arr=grid[0:3, 0:3])
+            render.plot_output_pattern(encoded_pattern, seed)
+        plt.show()
 
 if __name__ == '__main__':
     main()
