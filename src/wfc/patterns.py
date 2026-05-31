@@ -129,10 +129,12 @@ class PatternLibrary:
         else:
             # if freqs not provided, assume uniform distribution
             freqs = np.ones(len(idx2pattern), dtype=np.int64)
+        index_to_width = None
+        index_to_height = None
         if 'index_to_width' in list(data):
-           index_to_width = data['index_to_width'][()]  # dict mapping pattern index to width value
+            index_to_width = data['index_to_width'][()]  # dict mapping pattern index to width value
         if 'index_to_height' in list(data):
-           index_to_height = data['index_to_height'][()]  # dict mapping pattern index to height value
+            index_to_height = data['index_to_height'][()]  # dict mapping pattern index to height value
         return cls((Ny, Nx), overlap, idx2pattern, freqs, index_to_width=index_to_width, index_to_height=index_to_height)
 
     def build_compatibility(self):
@@ -383,3 +385,301 @@ class PatternLibrary:
         for d, dir_name in enumerate(['UP', 'RIGHT', 'DOWN', 'LEFT']):
             count_no_compat = sum(1 for i in range(K) if len(allow[i][d]) == 0)
             print(f"Direction {dir_name}: {count_no_compat} patterns have no compatible neighbors")
+
+    def new_build_compatibility_for_range_pattern_fast(self):
+        """
+        Fast compatibility for range patterns with wildcard zero matching.
+
+        Pattern shape: (m, n, 3) where m>=3, n>=3.
+        - Channel 0 (motif): binary (0 or 1), standard N-1 overlap exact match.
+        - Channel 1 (Heights): integers, zeros only in first/last row of pattern.
+        - Channel 2 (Widths): integers, zeros only in first/last column of pattern.
+        N-1 overlap with zero matching any value for channels 1&2.
+
+        Optimization: splits overlap into "exact" positions (no zeros possible,
+        hash-based grouping) and "border" positions (zeros possible, wildcard check).
+        """
+        Ny, Nx = self.Ny, self.Nx
+        ov_y, ov_x = self.overlap_y, self.overlap_x
+        K = self.K
+
+        motif_patterns = [p[:, :, 0] for p in self.idx2pattern]
+        ch12_patterns = [p[:, :, 1:] for p in self.idx2pattern]  # shape (Ny, Nx, 2)
+
+        # Edge extractors for motif (2D) overlap
+        motif_extractors = {
+            self.UP:    (lambda m: m[:ov_y, :],     lambda m: m[Ny-ov_y:, :]),
+            self.DOWN:  (lambda m: m[Ny-ov_y:, :],  lambda m: m[:ov_y, :]),
+            self.LEFT:  (lambda m: m[:, :ov_x],     lambda m: m[:, Nx-ov_x:]),
+            self.RIGHT: (lambda m: m[:, Nx-ov_x:],  lambda m: m[:, :ov_x]),
+        }
+
+        # Edge extractors for channels 1&2 (3D) overlap
+        ch12_extractors = {
+            self.UP:    (lambda c: c[:ov_y, :, :],     lambda c: c[Ny-ov_y:, :, :]),
+            self.DOWN:  (lambda c: c[Ny-ov_y:, :, :],  lambda c: c[:ov_y, :, :]),
+            self.LEFT:  (lambda c: c[:, :ov_x, :],     lambda c: c[:, Nx-ov_x:, :]),
+            self.RIGHT: (lambda c: c[:, Nx-ov_x:, :],  lambda c: c[:, :ov_x, :]),
+        }
+
+        # Build zero-possible masks for each direction.
+        # Heights (ch12[:,:,0]): zeros only at row 0 and row Ny-1 of full pattern.
+        # Widths (ch12[:,:,1]): zeros only at col 0 and col Nx-1 of full pattern.
+        def build_zero_masks(d):
+            if d in (self.UP, self.DOWN):
+                shape = (ov_y, Nx, 2)
+            else:
+                shape = (Ny, ov_x, 2)
+            src_zmask = np.zeros(shape, dtype=bool)
+            tgt_zmask = np.zeros(shape, dtype=bool)
+
+            if d == self.UP:
+                # src = rows[0:ov_y] of pattern i
+                src_zmask[0, :, 0] = True            # Heights: first row of pattern
+                src_zmask[:, 0, 1] = True            # Widths: first col
+                src_zmask[:, Nx-1, 1] = True         # Widths: last col
+                # tgt = rows[Ny-ov_y:Ny] of pattern j
+                tgt_zmask[ov_y-1, :, 0] = True       # Heights: last row of pattern
+                tgt_zmask[:, 0, 1] = True
+                tgt_zmask[:, Nx-1, 1] = True
+            elif d == self.DOWN:
+                # src = rows[Ny-ov_y:Ny] of pattern i
+                src_zmask[ov_y-1, :, 0] = True       # Heights: last row of pattern
+                src_zmask[:, 0, 1] = True
+                src_zmask[:, Nx-1, 1] = True
+                # tgt = rows[0:ov_y] of pattern j
+                tgt_zmask[0, :, 0] = True            # Heights: first row of pattern
+                tgt_zmask[:, 0, 1] = True
+                tgt_zmask[:, Nx-1, 1] = True
+            elif d == self.LEFT:
+                # src = cols[0:ov_x] of pattern i
+                src_zmask[0, :, 0] = True            # Heights: first row
+                src_zmask[Ny-1, :, 0] = True         # Heights: last row
+                src_zmask[:, 0, 1] = True            # Widths: first col of pattern
+                # tgt = cols[Nx-ov_x:Nx] of pattern j
+                tgt_zmask[0, :, 0] = True
+                tgt_zmask[Ny-1, :, 0] = True
+                tgt_zmask[:, ov_x-1, 1] = True      # Widths: last col of pattern
+            elif d == self.RIGHT:
+                # src = cols[Nx-ov_x:Nx] of pattern i
+                src_zmask[0, :, 0] = True
+                src_zmask[Ny-1, :, 0] = True
+                src_zmask[:, ov_x-1, 1] = True      # Widths: last col of pattern
+                # tgt = cols[0:ov_x] of pattern j
+                tgt_zmask[0, :, 0] = True
+                tgt_zmask[Ny-1, :, 0] = True
+                tgt_zmask[:, 0, 1] = True            # Widths: first col of pattern
+
+            return src_zmask, tgt_zmask
+
+        allow: List[List[set]] = [[set() for _ in range(4)] for _ in range(K)]
+
+        for d in range(4):
+            motif_src_ex, motif_tgt_ex = motif_extractors[d]
+            ch12_src_ex, ch12_tgt_ex = ch12_extractors[d]
+
+            src_zmask, tgt_zmask = build_zero_masks(d)
+            any_zmask = src_zmask | tgt_zmask
+            exact_mask = ~any_zmask
+            has_exact = np.any(exact_mask)
+            has_border = np.any(any_zmask)
+
+            # Build target groups keyed by (motif_edge + ch12_exact_positions)
+            tgt_groups = defaultdict(list)
+            for j in range(K):
+                motif_key = self._edge_key(motif_tgt_ex(motif_patterns[j]))
+                if has_exact:
+                    ch12_tgt = ch12_tgt_ex(ch12_patterns[j])
+                    exact_key = np.ascontiguousarray(ch12_tgt[exact_mask]).tobytes()
+                    combined_key = motif_key + exact_key
+                else:
+                    combined_key = motif_key
+                tgt_groups[combined_key].append(j)
+
+            # Pre-extract border values for wildcard check
+            if has_border:
+                ch12_src_borders = []
+                ch12_tgt_borders = []
+                for idx in range(K):
+                    src_edge = ch12_src_ex(ch12_patterns[idx])
+                    tgt_edge = ch12_tgt_ex(ch12_patterns[idx])
+                    ch12_src_borders.append(np.ascontiguousarray(src_edge[any_zmask]))
+                    ch12_tgt_borders.append(np.ascontiguousarray(tgt_edge[any_zmask]))
+
+            # Match src patterns against target groups
+            for i in range(K):
+                motif_key = self._edge_key(motif_src_ex(motif_patterns[i]))
+                if has_exact:
+                    ch12_src = ch12_src_ex(ch12_patterns[i])
+                    exact_key = np.ascontiguousarray(ch12_src[exact_mask]).tobytes()
+                    combined_key = motif_key + exact_key
+                else:
+                    combined_key = motif_key
+
+                if combined_key in tgt_groups:
+                    if has_border:
+                        src_border = ch12_src_borders[i]
+                        for j in tgt_groups[combined_key]:
+                            tgt_border = ch12_tgt_borders[j]
+                            if np.all((src_border == 0) | (tgt_border == 0) | (src_border == tgt_border)):
+                                allow[i][d].add(j)
+                    else:
+                        # No border positions → exact hash fully determines compatibility
+                        allow[i][d] = set(tgt_groups[combined_key])
+
+        self.allow = allow
+        for d, dir_name in enumerate(['UP', 'RIGHT', 'DOWN', 'LEFT']):
+            count_no_compat = sum(1 for i in range(K) if len(allow[i][d]) == 0)
+            print(f"Direction {dir_name}: {count_no_compat} patterns have no compatible neighbors")
+
+    # ---- Transition-matrix-only compatibility builders ----
+    # These produce self.T (shape (4, K, K), bool) directly without
+    # intermediate Python sets. Much faster for large K.
+
+    def build_compatibility_matrix(self):
+        """
+        Build compatibility as a numpy transition matrix directly.
+        Uses edge hashing (O(K)) and vectorized numpy assignment.
+        Result: self.T of shape (4, K, K), dtype bool.
+        T[d, i, j] = True means pattern j can be in direction d from pattern i.
+        """
+        Ny, Nx = self.Ny, self.Nx
+        ov_y, ov_x = self.overlap_y, self.overlap_x
+        K = self.K
+        patterns = self.idx2pattern
+
+        edge_extractors = {
+            self.UP:    (lambda p: p[:ov_y, :, :],      lambda p: p[Ny-ov_y:, :, :]),
+            self.DOWN:  (lambda p: p[Ny-ov_y:, :, :],   lambda p: p[:ov_y, :, :]),
+            self.LEFT:  (lambda p: p[:, :ov_x, :],      lambda p: p[:, Nx-ov_x:, :]),
+            self.RIGHT: (lambda p: p[:, Nx-ov_x:, :],   lambda p: p[:, :ov_x, :]),
+        }
+
+        T = np.zeros((4, K, K), dtype=bool)
+        for d in range(4):
+            src_extract, tgt_extract = edge_extractors[d]
+            tgt_groups = defaultdict(list)
+            for j, B in enumerate(patterns):
+                key = self._edge_key(tgt_extract(B))
+                tgt_groups[key].append(j)
+            for i, A in enumerate(patterns):
+                key = self._edge_key(src_extract(A))
+                if key in tgt_groups:
+                    T[d, i, tgt_groups[key]] = True
+
+        self.T = T
+        for d, dir_name in enumerate(['UP', 'RIGHT', 'DOWN', 'LEFT']):
+            no_compat = np.sum(T[d].sum(axis=1) == 0)
+            print(f"Direction {dir_name}: {no_compat} patterns have no compatible neighbors")
+
+    def build_compatibility_for_range_pattern_matrix(self):
+        """
+        Build range-pattern compatibility as a numpy transition matrix directly.
+        Two-stage filter: motif overlap + height/width sub-pattern check.
+        Result: self.T of shape (4, K, K), dtype bool.
+        """
+        Ny, Nx = self.Ny, self.Nx
+        ov_y, ov_x = self.overlap_y, self.overlap_x
+        K = self.K
+
+        motif_patterns = [p[:, :, 0] for p in self.idx2pattern]
+        hw_patterns = [p[1:Ny-1, 1:Nx-1, 1:] for p in self.idx2pattern]
+
+        # Stage 1: motif compatibility via hashing → T_motif
+        motif_extractors = {
+            self.UP:    (lambda m: m[:ov_y, :],     lambda m: m[Ny-ov_y:, :]),
+            self.DOWN:  (lambda m: m[Ny-ov_y:, :],  lambda m: m[:ov_y, :]),
+            self.LEFT:  (lambda m: m[:, :ov_x],     lambda m: m[:, Nx-ov_x:]),
+            self.RIGHT: (lambda m: m[:, Nx-ov_x:],  lambda m: m[:, :ov_x]),
+        }
+
+        T_motif = np.zeros((4, K, K), dtype=bool)
+        for d in range(4):
+            src_ex, tgt_ex = motif_extractors[d]
+            tgt_groups = defaultdict(list)
+            for j, M in enumerate(motif_patterns):
+                tgt_groups[self._edge_key(tgt_ex(M))].append(j)
+            for i, M in enumerate(motif_patterns):
+                key = self._edge_key(src_ex(M))
+                if key in tgt_groups:
+                    T_motif[d, i, tgt_groups[key]] = True
+
+        # Stage 2: filter by hw sub-pattern compatibility
+        ov_sub_y = ov_y - 2
+        ov_sub_x = ov_x - 2
+        Hy = Ny - 2
+        Hx = Nx - 2
+
+        T = np.zeros((4, K, K), dtype=bool)
+
+        # UP/DOWN filtering
+        if ov_sub_y <= 0:
+            # Group by width-key (hw[:, :, 1:])
+            width_group_ids = np.empty(K, dtype=np.int32)
+            key_to_id = {}
+            for idx, hw in enumerate(hw_patterns):
+                key = self._edge_key(hw[:, :, 1:])
+                if key not in key_to_id:
+                    key_to_id[key] = len(key_to_id)
+                width_group_ids[idx] = key_to_id[key]
+            # width_compat[i, j] = True if same width group
+            width_compat = (width_group_ids[:, None] == width_group_ids[None, :])
+            for d in (self.UP, self.DOWN):
+                T[d] = T_motif[d] & width_compat
+        else:
+            hw_vert_extractors = {
+                self.UP:   (lambda h: h[:ov_sub_y, :, :],     lambda h: h[Hy-ov_sub_y:, :, :]),
+                self.DOWN: (lambda h: h[Hy-ov_sub_y:, :, :],  lambda h: h[:ov_sub_y, :, :]),
+            }
+            for d in (self.UP, self.DOWN):
+                src_ex, tgt_ex = hw_vert_extractors[d]
+                tgt_groups = defaultdict(list)
+                for j, hw in enumerate(hw_patterns):
+                    tgt_groups[self._edge_key(tgt_ex(hw))].append(j)
+                for i in range(K):
+                    key = self._edge_key(src_ex(hw_patterns[i]))
+                    if key in tgt_groups:
+                        js = tgt_groups[key]
+                        # Only keep j's that also pass motif check
+                        mask = T_motif[d, i, js]
+                        compatible_js = [js[idx] for idx, m in enumerate(mask) if m]
+                        if compatible_js:
+                            T[d, i, compatible_js] = True
+
+        # LEFT/RIGHT filtering
+        if ov_sub_x <= 0:
+            # Group by height-key (hw[:, :, 0:1])
+            height_group_ids = np.empty(K, dtype=np.int32)
+            key_to_id = {}
+            for idx, hw in enumerate(hw_patterns):
+                key = self._edge_key(hw[:, :, 0:1])
+                if key not in key_to_id:
+                    key_to_id[key] = len(key_to_id)
+                height_group_ids[idx] = key_to_id[key]
+            # height_compat[i, j] = True if same height group
+            height_compat = (height_group_ids[:, None] == height_group_ids[None, :])
+            for d in (self.RIGHT, self.LEFT):
+                T[d] = T_motif[d] & height_compat
+        else:
+            hw_horiz_extractors = {
+                self.LEFT:  (lambda h: h[:, :ov_sub_x, :],     lambda h: h[:, Hx-ov_sub_x:, :]),
+                self.RIGHT: (lambda h: h[:, Hx-ov_sub_x:, :],  lambda h: h[:, :ov_sub_x, :]),
+            }
+            for d in (self.RIGHT, self.LEFT):
+                src_ex, tgt_ex = hw_horiz_extractors[d]
+                tgt_groups = defaultdict(list)
+                for j, hw in enumerate(hw_patterns):
+                    tgt_groups[self._edge_key(tgt_ex(hw))].append(j)
+                for i in range(K):
+                    key = self._edge_key(src_ex(hw_patterns[i]))
+                    if key in tgt_groups:
+                        js = tgt_groups[key]
+                        mask = T_motif[d, i, js]
+                        compatible_js = [js[idx] for idx, m in enumerate(mask) if m]
+                        if compatible_js:
+                            T[d, i, compatible_js] = True
+
+        self.T = T
+        for d, dir_name in enumerate(['UP', 'RIGHT', 'DOWN', 'LEFT']):
+            no_compat = np.sum(T[d].sum(axis=1) == 0)
+            print(f"Direction {dir_name}: {no_compat} patterns have no compatible neighbors")

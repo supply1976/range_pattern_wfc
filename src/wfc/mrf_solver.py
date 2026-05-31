@@ -5,7 +5,7 @@ class MRFSolver(BaseSolver):
     def solve(self, H:int, W:int, seed=None, start_token=None):
         rng = np.random.default_rng(seed)
         K = self.lib.K
-        weights = self.lib.weights
+        weights = self.lib.freqs / self.lib.freqs.sum()
         allow = self.lib.allow
         if allow is None:
             raise ValueError("Compatibility table not built.")

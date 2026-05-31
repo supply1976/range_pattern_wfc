@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 
 class RangePatternRenderer:
-    """Renderer for range patterns, which are defined by width and height values rather than pixel arrays."""
+    """Renderer the WFC output grid to real geometry pattern."""
     def __init__(self, patterns, index_to_width, index_to_height, context_size=50):
         self.patterns = patterns
         self.index_to_width = index_to_width
@@ -14,16 +14,42 @@ class RangePatternRenderer:
         self.index_to_width[0] = context_size
         self.index_to_height[0] = context_size
     
-    def pattern_decode(self, pattern):
-        # decode the encoded pattern into motif, heights, and widths
-        # pattern shape (m, n, 3)
+    def pattern_decode(self, pattern, remove_context=False):
+        """Decode the encoded pattern into motif, heights, and widths.
+        pattern: int array of shape (m, n, 3)
+        """
+        if remove_context:
+            # remove the 1-pixel context border around the motif, and the corresponding heights and widths
+            pattern = pattern[1:-1, 1:-1, :]
         motif, H, W = pattern[:, :, 0], pattern[:, :, 1], pattern[:, :, 2]
         enc_heights = H[:, 1]  # take the first column of heights, shape (m,)
         enc_widths = W[1, :]  # take the first row of widths, shape (n,)
-        heights = np.array([self.index_to_height[h] for h in enc_heights])
-        widths = np.array([self.index_to_width[w] for w in enc_widths])
+        heights = np.array([self.index_to_height[h] for h in enc_heights]) # real dimension (nm)
+        widths = np.array([self.index_to_width[w] for w in enc_widths]) # real dimension (nm)
         return motif, heights, widths
-    
+   
+    def pattern_to_bbox_list(self, pattern):
+        """Convert the decoded pattern into a list of bounding boxes for "on" cells in the motif, for GDS export. Each bbox is [llx, lly, urx, ury]. The coordinate system is with origin at lower left, x increases to the right, y increases upwards.
+        return: list of bboxes, each bbox is [llx, lly, urx, ury]
+        """
+        
+        motif, heights, widths = self.pattern_decode(pattern, remove_context=True)
+        # up-down filp for motif and heights to match the coordinate system of GDS (origin at lower left, y increases upwards)
+        motif = np.flipud(motif)
+        heights = np.flipud(heights)
+        heights = np.insert(heights, 0, 0) # insert zero for edge coordinates, so the first pattern cell starts at height 0. The last pattern cell will end at the last cumulative height value, which is the total height of the synthesized pattern.
+        widths = np.insert(widths, 0, 0)
+        h_cum = np.cumsum(heights)
+        w_cum = np.cumsum(widths)
+        bboxes = []
+        for r, c in zip(*np.where(motif == 1)):
+            llx = float(w_cum[c])
+            lly = float(h_cum[r])
+            urx = float(w_cum[c + 1])
+            ury = float(h_cum[r + 1])
+            bboxes.append([llx, lly, urx, ury])
+        return bboxes
+ 
     def plot_output_pattern(self, pattern, seed, savedir=None):
         motif, heights, widths = self.pattern_decode(pattern)
         heights = np.insert(heights, 0, 0) # insert zero for pcolormesh
